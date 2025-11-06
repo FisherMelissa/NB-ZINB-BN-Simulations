@@ -1,0 +1,14 @@
+# Core dependencies for Bayesian Network demo
+# Note: The bn_do_intervention.py script uses only built-in Python libraries
+# For full pgmpy functionality, uncomment the following lines:
+# pgmpy
+# networkx
+
+# Dependencies for ZINB simulation
+statsmodels>=0.14
+pandas
+numpy
+matplotlib
+plotly
+streamlit
+networkx
