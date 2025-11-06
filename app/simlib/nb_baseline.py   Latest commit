@@ -1,0 +1,154 @@
+"""Utilities for the Negative Binomial baseline scenario used in the Streamlit app."""
+
+from __future__ import annotations
+
+from typing import Dict, Iterable, Tuple
+
+import numpy as np
+import pandas as pd
+
+NB_COEFFICIENTS: Dict[str, float] = {
+    "intercept": 1.35,
+    "parenting_risk": 0.85,
+    "peer_risk": 0.28,
+    "law_edu": -0.4,
+    "night_net": 0.07,
+    "seasonality": 0.22,
+    "trend": 0.04,
+}
+
+DEFAULT_ALPHA: float = 0.65
+DEFAULT_MONTHS: Tuple[int, ...] = (4, 5, 6)
+
+
+def generate_nb_baseline_dataset(seed: int = 42) -> pd.DataFrame:
+    """Generate a synthetic 12-month dataset with risk factors and observed counts."""
+    rng = np.random.default_rng(seed)
+    months = np.arange(1, 13)
+
+    parenting_risk = np.clip(rng.normal(0.55, 0.12, size=12), 0.1, 0.95)
+    peer_risk = rng.choice([0, 1, 2, 3], size=12, p=[0.25, 0.3, 0.25, 0.2]).astype(float)
+    law_edu = rng.choice([0.0, 1.0, 2.0], size=12, p=[0.2, 0.5, 0.3])
+    night_net = np.clip(rng.normal(5.5, 1.8, size=12), 0.2, 9.5)
+
+    risk_window = (months >= 4) & (months <= 6)
+    parenting_risk[risk_window] = np.clip(parenting_risk[risk_window] + 0.18, 0.1, 0.98)
+    peer_risk[risk_window] = np.clip(peer_risk[risk_window] + rng.uniform(0.4, 0.8, risk_window.sum()), 0, 3.5)
+    law_edu[risk_window] = np.clip(law_edu[risk_window] - 0.4, 0.0, 2.0)
+    night_net[risk_window] = np.clip(night_net[risk_window] + rng.uniform(0.8, 1.4, risk_window.sum()), 0.2, 10)
+
+    data = pd.DataFrame(
+        {
+            "month": months,
+            "parenting_risk": parenting_risk,
+            "peer_risk": peer_risk,
+            "law_edu": law_edu,
+            "night_net": night_net,
+        }
+    )
+
+    mu = compute_nb_mean(data)
+    observed = _draw_negative_binomial(mu, DEFAULT_ALPHA, rng)
+    data["observed_count"] = observed.astype(int)
+    return data
+
+
+def compute_nb_mean(data: pd.DataFrame, coefficients: Dict[str, float] | None = None) -> np.ndarray:
+    """Compute the NB mean (mu) for each row."""
+    coefs = coefficients or NB_COEFFICIENTS
+    month_centered = (data["month"] - data["month"].mean()) / data["month"].std()
+    seasonal_term = np.sin(2 * np.pi * data["month"] / 12.0)
+
+    log_mu = (
+        coefs["intercept"]
+        + coefs["parenting_risk"] * data["parenting_risk"].to_numpy()
+        + coefs["peer_risk"] * data["peer_risk"].to_numpy()
+        + coefs["law_edu"] * data["law_edu"].to_numpy()
+        + coefs["night_net"] * data["night_net"].to_numpy()
+        + coefs["seasonality"] * seasonal_term.to_numpy()
+        + coefs["trend"] * month_centered.to_numpy()
+    )
+
+    return np.exp(log_mu)
+
+
+def apply_month_scenario(
+    data: pd.DataFrame,
+    scenario_values: Dict[str, float],
+    months: Iterable[int] = DEFAULT_MONTHS,
+) -> pd.DataFrame:
+    """Return a copy of *data* with scenario adjustments applied to the selected months."""
+    scenario_data = data.copy()
+    mask = scenario_data["month"].isin(list(months))
+
+    for column, value in scenario_values.items():
+        if column in scenario_data.columns:
+            scenario_data.loc[mask, column] = value
+
+    return scenario_data
+
+
+def run_nb_scenario(
+    data: pd.DataFrame,
+    scenario_values: Dict[str, float],
+    alpha: float,
+    runs: int,
+    seed: int,
+    months: Iterable[int] = DEFAULT_MONTHS,
+) -> Dict[str, object]:
+    """Evaluate the baseline vs scenario for the specified months."""
+    alpha = max(alpha, 1e-3)
+    runs = max(1, runs)
+
+    baseline_mu = compute_nb_mean(data)
+    scenario_data = apply_month_scenario(data, scenario_values, months)
+    scenario_mu = compute_nb_mean(scenario_data)
+
+    months_mask = scenario_data["month"].isin(list(months)).to_numpy()
+
+    baseline_samples = _simulate_counts(baseline_mu, alpha, runs, seed)
+    scenario_samples = _simulate_counts(scenario_mu, alpha, runs, seed + 1)
+
+    baseline_totals = baseline_samples[:, months_mask].sum(axis=1)
+    scenario_totals = scenario_samples[:, months_mask].sum(axis=1)
+
+    def _summary(arr: np.ndarray) -> Dict[str, float]:
+        return {
+            "mean": float(np.mean(arr)),
+            "p10": float(np.percentile(arr, 10)),
+            "p90": float(np.percentile(arr, 90)),
+        }
+
+    summary = {
+        "baseline": _summary(baseline_totals),
+        "scenario": _summary(scenario_totals),
+        "delta_mean": float(np.mean(scenario_totals) - np.mean(baseline_totals)),
+    }
+
+    return {
+        "scenario_data": scenario_data,
+        "baseline_mu": baseline_mu,
+        "scenario_mu": scenario_mu,
+        "summary": summary,
+        "baseline_samples": baseline_samples,
+        "scenario_samples": scenario_samples,
+    }
+
+
+def _simulate_counts(mu: np.ndarray, alpha: float, runs: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    samples = np.empty((runs, len(mu)), dtype=int)
+
+    size_param = np.full_like(mu, 1.0 / alpha, dtype=float)
+    prob_param = size_param / (size_param + mu)
+
+    for i in range(runs):
+        samples[i] = rng.negative_binomial(size_param, prob_param)
+
+    return samples
+
+
+def _draw_negative_binomial(mu: np.ndarray, alpha: float, rng: np.random.Generator) -> np.ndarray:
+    size_param = np.full_like(mu, 1.0 / alpha, dtype=float)
+    prob_param = size_param / (size_param + mu)
+    return rng.negative_binomial(size_param, prob_param)
