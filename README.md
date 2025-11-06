@@ -1,5 +1,4 @@
 # NB-ZINB-BN-Simulations
-# cto.new
 Ai-service
 
 ## Bayesian Network do-intervention Demo
